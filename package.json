@@ -4,8 +4,9 @@
   "type": "module",
   "main": "app.js",
   "scripts": {
-    "start": "node app.js",
-    "dev": "nodemon app.js"
+    "start": "node api/index.js",
+    "dev": "nodemon api/index.js",
+    "dev:old": "nodemon app.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

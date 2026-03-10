@@ -2,55 +2,115 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { google } from "googleapis";
+import fs from "fs";
+import path from "path";
 
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const SPREADSHEET_ID_CONTENT = process.env.SPREADSHEET_ID_CONTENT;
-const SPREADSHEET_ID_BOOKING = process.env.SPREADSHEET_ID_BOOKING;
-
-// CORS
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (req.method === "OPTIONS") return res.status(200).end();
-  next();
-});
-app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"], allowedHeaders: ["Content-Type", "Authorization"] }));
+app.use(cors());
 app.use(express.json());
 
-// Google Sheets 認證（有設定時才使用）
-let sheetsClient = null;
-if (process.env.GOOGLE_CLIENT_EMAIL && process.env.GOOGLE_PRIVATE_KEY) {
-  const auth = new google.auth.GoogleAuth({
+const PORT = process.env.PORT || 3000;
+
+const SHEET_ID = process.env.SHEET_ID;
+
+// Google Sheets 認證（優先從金鑰 JSON 檔讀取，私鑰格式才不會出錯）
+const KEY_FILE = process.env.GOOGLE_APPLICATION_CREDENTIALS || process.env.GOOGLE_KEY_FILE;
+
+function getAuth() {
+  if (KEY_FILE) {
+    const keyPath = path.isAbsolute(KEY_FILE) ? KEY_FILE : path.resolve(process.cwd(), KEY_FILE);
+    if (!fs.existsSync(keyPath)) {
+      throw new Error(`金鑰檔案不存在: ${keyPath}`);
+    }
+    const keyJson = JSON.parse(fs.readFileSync(keyPath, "utf8"));
+    return new google.auth.GoogleAuth({
+      credentials: {
+        client_email: keyJson.client_email,
+        private_key: keyJson.private_key,
+      },
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+    });
+  }
+  const raw = process.env.GOOGLE_PRIVATE_KEY;
+  const privateKey = raw
+    ? raw.includes("\n")
+      ? raw.trim()
+      : raw.replace(/\\n/g, "\n").trim()
+    : undefined;
+  return new google.auth.GoogleAuth({
     credentials: {
-      client_email: process.env.GOOGLE_CLIENT_EMAIL,
-      private_key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
+      client_email: process.env.GOOGLE_CLIENT_EMAIL?.trim(),
+      private_key: privateKey,
     },
     scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
-  sheetsClient = google.sheets({ version: "v4", auth });
 }
 
-const readSheet = async (range, spreadsheetId = SPREADSHEET_ID_CONTENT) => {
-  if (!sheetsClient) throw new Error("Google Sheets 未設定");
-  const res = await sheetsClient.spreadsheets.values.get({ spreadsheetId, range });
+const auth = getAuth();
+
+const sheetsClient = google.sheets({ version: "v4", auth });
+
+// 讀取分頁（同一份試算表內不同工作表，如 Course、Booking）
+const readSheet = async (range) => {
+  if (!SHEET_ID) throw new Error("SHEET_ID 未設定");
+  const res = await sheetsClient.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range,
+  });
   return res.data.values || [];
 };
 
-const readContentSheet = async (range) => {
-  if (!SPREADSHEET_ID_CONTENT) throw new Error("SPREADSHEET_ID_CONTENT 未設定");
-  return readSheet(range, SPREADSHEET_ID_CONTENT);
+
+// 根路徑：顯示 API 說明
+app.get("/", (req, res) => {
+  res.json({
+    message: "PocketAlchemist Backend API",
+    docs: {
+      health: "/api/health",
+      maps: `/api/${SheetTabName.maps}`,
+      items: `/api/${SheetTabName.items}`,
+      objects: `/api/${SheetTabName.objects}`,
+      quests: `/api/${SheetTabName.quests}`,
+      logs: `/api/${SheetTabName.logs}`,
+    },
+  });
+});
+
+
+// ========== 取得資料 ==========
+const SheetTabName = {
+  maps: "maps",
+  items: "items",
+  objects: "objects",
+  quests: "quests",
+  logs: "logs",
 };
 
-const readBookingSheet = async (range) => {
-  if (!SPREADSHEET_ID_BOOKING) throw new Error("SPREADSHEET_ID_BOOKING 未設定");
-  return readSheet(range, SPREADSHEET_ID_BOOKING);
-};
+// GET /api/分頁名稱 — 讀取分頁資料
+app.get(`/api/${SheetTabName.maps}`, async (req, res) => {
+  try {
+    if (!SHEET_ID) {
+      return res.status(500).json({ error: "SHEET_ID 未設定" });
+    }
+    const raw = await readSheet(`'${SheetTabName.maps}'!A1:E999`);
+    if (!raw || raw.length < 1) return res.json([]);
+    const headers = raw[0];
+    const rows = raw.slice(1).map((row) => {
+      const obj = {};
+      headers.forEach((key, i) => (obj[key] = row[i] ?? ""));
+      return obj;
+    });
+    res.json(rows);
+  } catch (err) {
+    console.error("讀取失敗:", err);
+    res.status(500).json({ error: "無法取得資料", details: err.message });
+  }
+});
 
+// ========== 寫入資料 ==========
+// 將 Sheet 列 → 物件陣列
 const sheetToObjects = (rows) => {
   if (!rows || rows.length < 2) return [];
   const header = rows[0];
@@ -61,130 +121,139 @@ const sheetToObjects = (rows) => {
   });
 };
 
+// ========== 遊戲測試回饋（log 分頁）==========
+/** 取得當前時間字串（台灣時區） */
+const nowString = () =>
+  new Date().toLocaleString("zh-TW", { timeZone: "Asia/Taipei" });
+
 // 健康檢查
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
+  res.json({ ok: true, message: "Backend running" });
 });
 
-app.options("/api/*", (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.status(200).end();
-});
+// 僅在本機開發時 listen
+// Vercel 會直接使用 export default app
+if (!process.env.VERCEL) {
+  app.listen(PORT, "localhost", () => {
+    console.log(`Backend running on http://localhost:${PORT}`);
+  });
+}
 
-// Google Sheet：讀取課程
-app.get("/api/courses", async (req, res) => {
+/*
+// POST /api/feedback — 提交一筆回饋（回報時間由後端產生；依 專案 寫入對應分頁）
+app.post("/api/feedback", async (req, res) => {
   try {
-    const raw = await readContentSheet("Course!A1:ZZ999");
-    if (!raw || raw.length < 3) return res.json([]);
-    const headers = raw[0];
-    const dataRows = raw.slice(2);
-    const rows = dataRows.map((row) => {
-      const obj = {};
-      headers.forEach((key, i) => (obj[key] = row[i] ?? ""));
-      return obj;
-    });
-    res.json(rows);
+    if (!SHEET_ID) {
+      return res.status(500).json({ error: "SHEET_ID 未設定" });
+    }
+    const { 專案, 回報類型, 回報區塊, 回報內容, 開發版本號 } = req.body;
+    const sheetName = toSheetTabName(專案);
+    const feedback = {
+      回報時間: nowString(),
+      回報類型: String(回報類型 ?? ""),
+      回報區塊: String(回報區塊 ?? ""),
+      回報內容: String(回報內容 ?? ""),
+      開發版本號: String(開發版本號 ?? ""),
+    };
+    const row = feedbackToRow(feedback);
+    await appendFeedbackToSheet(row, sheetName);
+    res.json({ success: true, message: `回饋已寫入分頁「${sheetName}」`, data: feedback });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "無法取得資料" });
-  }
-});
-
-// Google Sheet：寫入報名
-app.post("/api/booking", async (req, res) => {
-  try {
-    if (!SPREADSHEET_ID_BOOKING) {
-      return res.status(500).json({ error: "SPREADSHEET_ID_BOOKING 未設定" });
-    }
-    const { sessionID, studentName, studentEmail, studentContact, studentNumber, cost, bookingNote } = req.body;
-    if (!sessionID || !studentName || !studentEmail || !studentContact) {
-      return res.status(400).json({ error: "缺少必要欄位", details: "請填寫：課程ID、姓名、Email、聯絡方式" });
-    }
-    let nextId = 1;
-    try {
-      const idColumn = await readBookingSheet("Booking!A:A");
-      if (idColumn && idColumn.length > 1) {
-        const ids = idColumn
-          .slice(1)
-          .map((row) => (row && row[0] ? Number(row[0]) : null))
-          .filter((id) => id != null && !isNaN(id) && id > 0);
-        if (ids.length > 0) nextId = Math.max(...ids) + 1;
-      }
-    } catch (e) {
-      console.error("讀取 ID 失敗:", e);
-    }
-    const bookingTime = new Date().toLocaleString("zh-TW", { timeZone: "Asia/Taipei" });
-    const newRow = [
-      nextId,
-      sessionID,
-      studentName,
-      studentEmail,
-      studentContact,
-      studentNumber ?? 1,
-      cost ?? 0,
-      bookingNote ?? "",
-      bookingTime,
-    ];
-    await sheetsClient.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID_BOOKING,
-      range: "'Booking'!A:I",
-      valueInputOption: "USER_ENTERED",
-      insertDataOption: "INSERT_ROWS",
-      requestBody: { values: [newRow] },
-    });
-    res.json({ success: true, bookingID: nextId, message: "新增報名成功", bookingTime });
-  } catch (err) {
-    console.error("寫入失敗:", err);
+    console.error("寫入回饋失敗:", err);
     res.status(500).json({
-      error: "寫入 Google Sheet 失敗",
-      details: err.message || "請檢查權限與環境變數",
+      error: "寫入分頁失敗",
+      details: err.message || "請確認試算表已有該分頁並已共用給服務帳號",
     });
   }
 });
+*/
 
-// Gemini 代理
-app.post("/api/gemini-chat", async (req, res) => {
-  if (!GEMINI_API_KEY) {
-    return res.status(500).json({
-      error: "Gemini API Key 未設定，請在環境變數中設定 GEMINI_API_KEY",
+/*
+// 若指定分頁第一列為空，先寫入標題列 
+const ensureHeader = async (sheetName) => {
+  const tab = toSheetTabName(sheetName);
+  const existing = await sheetsClient.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `'${tab}'!A1:E1`,
+  });
+  const rows = existing.data.values || [];
+  if (rows.length === 0 || !rows[0] || !rows[0][0]) {
+    await sheetsClient.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: `'${tab}'!A1:E1`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: [FEEDBACK_HEADERS] },
     });
   }
+};
+
+// 寫入一筆回饋到指定分頁（必要時先寫入標題） 
+const appendFeedbackToSheet = async (row, sheetName = "theDev") => {
+  const tab = toSheetTabName(sheetName);
+  await ensureHeader(tab);
+  await sheetsClient.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: `'${tab}'!A:E`,
+    valueInputOption: "USER_ENTERED",
+    insertDataOption: "INSERT_ROWS",
+    requestBody: { values: [row] },
+  });
+};
+
+// 產生一筆模擬遊戲測試回饋 
+const createMockFeedback = () => {
+  const mockContents = [
+    "進入選單時偶發閃退",
+    "按鈕點擊反饋不明顯，建議加強動效",
+    "完成關卡 3 後成就未解鎖",
+    "設定頁面載入較慢",
+    "戰鬥中技能冷卻數字不清楚",
+  ];
+  return {
+    回報時間: nowString(),
+    回報類型: REPORT_TYPES[Math.floor(Math.random() * REPORT_TYPES.length)],
+    回報區塊: REPORT_BLOCKS[Math.floor(Math.random() * REPORT_BLOCKS.length)],
+    回報內容:
+      mockContents[Math.floor(Math.random() * mockContents.length)],
+    開發版本號: "v0.1.0",
+  };
+};
+
+// 回饋物件轉成 Sheet 一列（順序與 FEEDBACK_HEADERS 一致） 
+const feedbackToRow = (fb) => [
+  fb.回報時間,
+  String(fb.回報類型 ?? ""),
+  String(fb.回報區塊 ?? ""),
+  String(fb.回報內容 ?? ""),
+  String(fb.開發版本號 ?? ""),
+];
+
+// 寫入一筆模擬回饋的共用邏輯（固定寫入 theDev 分頁）
+async function handleMockFeedback(req, res) {
   try {
-    const { contents, systemInstruction, generationConfig } = req.body;
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents,
-          systemInstruction,
-          generationConfig: generationConfig || { response_mime_type: "application/json" },
-        }),
-      }
-    );
-    if (!response.ok) {
-      const errorText = await response.text();
-      let errorData;
-      try {
-        errorData = JSON.parse(errorText);
-      } catch {
-        errorData = { message: errorText };
-      }
-      return res.status(response.status).json(errorData);
+    if (!SHEET_ID) {
+      return res.status(500).json({ error: "SHEET_ID 未設定" });
     }
-    const data = await response.json();
-    res.json(data);
-  } catch (error) {
-    console.error("Gemini API 錯誤:", error);
-    res.status(500).json({ error: "伺服器錯誤", message: error.message });
+    const mock = createMockFeedback();
+    const row = feedbackToRow(mock);
+    await appendFeedbackToSheet(row, "theDev");
+    res.json({ success: true, message: "已寫入模擬回饋到 theDev 分頁", data: mock });
+  } catch (err) {
+    console.error("寫入模擬回饋失敗:", err);
+    res.status(500).json({
+      error: "寫入 theDev 分頁失敗",
+      details: err.message || "請確認試算表已有「theDev」分頁並已共用給服務帳號",
+    });
   }
-});
+}
 
-app.listen(PORT, () => {
-  console.log(`Backend running on port ${PORT}`);
-  console.log(`Gemini API Key: ${GEMINI_API_KEY ? "已設定" : "未設定"}`);
-  console.log(`Google Sheet: ${sheetsClient ? "已設定" : "未設定"}`);
-});
+// GET /api/feedback/mock — 瀏覽器開網址即可寫入一筆模擬回饋
+app.get("/api/feedback/mock", handleMockFeedback);
+// POST /api/feedback/mock
+app.post("/api/feedback/mock", handleMockFeedback);
+*/
+
+
+
+
+export default app;
