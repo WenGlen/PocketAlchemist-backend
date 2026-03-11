@@ -81,6 +81,9 @@ app.get("/", (req, res) => {
         quests: `POST /api/${SheetTabName.quests}/upload`,
         questList: `POST /api/${SheetTabName.questList}/upload`,
       },
+      update: {
+        quest: `PUT /api/${SheetTabName.quests}/:questId`,
+      },
     },
   });
 });
@@ -240,6 +243,60 @@ const createUploadHandler = (tabName) => async (req, res) => {
 // ========== 上傳路由 ==========
 app.post(`/api/${SheetTabName.quests}/upload`, createUploadHandler(SheetTabName.quests));
 app.post(`/api/${SheetTabName.questList}/upload`, createUploadHandler(SheetTabName.questList));
+
+// ========== 序列化單一欄位值（用於寫回 Sheet）==========
+const serializeSheetValue = (value) => {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+};
+
+// ========== PUT /api/quests/:questId — 更新單筆任務 ==========
+app.put(`/api/${SheetTabName.quests}/:questId`, async (req, res) => {
+  try {
+    if (!SHEET_ID) return res.status(500).json({ error: "SHEET_ID 未設定" });
+
+    const { questId } = req.params;
+    const questData = req.body;
+
+    // 1. 讀取目前 sheet（取得表頭與所有資料列）
+    const raw = await readSheet(`'${SheetTabName.quests}'!A1:Z999`);
+    if (!raw || raw.length < 2) {
+      return res.status(404).json({ error: "quests 分頁沒有資料" });
+    }
+
+    const headers = raw[0];
+    const dataRows = raw.slice(1);
+
+    // 2. 找到目標列的位置（依 id 欄比對）
+    const idColIndex = headers.indexOf("id");
+    if (idColIndex === -1) {
+      return res.status(500).json({ error: "quests 分頁找不到 id 欄位" });
+    }
+
+    const rowIndex = dataRows.findIndex((row) => row[idColIndex] === questId);
+    if (rowIndex === -1) {
+      return res.status(404).json({ error: `找不到任務 ID：${questId}` });
+    }
+
+    // 3. 依表頭順序序列化 questData → 列陣列
+    const newRow = headers.map((h) => serializeSheetValue(questData[h]));
+
+    // 4. 更新指定列（sheet 第 1 列是表頭，資料從第 2 列起，故 rowIndex + 2）
+    const sheetRowNumber = rowIndex + 2;
+    await sheetsClient.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: `'${SheetTabName.quests}'!A${sheetRowNumber}`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: [newRow] },
+    });
+
+    res.json({ success: true, message: `任務 ${questId} 已更新`, questId });
+  } catch (err) {
+    console.error("更新任務失敗:", err);
+    res.status(500).json({ error: "更新失敗", details: err.message });
+  }
+});
 
 
 //════════════════════════════════════════════════════════════════
