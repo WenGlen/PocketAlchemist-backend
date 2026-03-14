@@ -78,6 +78,9 @@ app.get("/", (req, res) => {
       quests: `/api/${SheetTabName.quests}`,
       questList: `/api/${SheetTabName.questList}`,
       upload: {
+        maps: `POST /api/${SheetTabName.maps}/upload`,
+        items: `POST /api/${SheetTabName.items}/upload`,
+        objects: `POST /api/${SheetTabName.objects}/upload`,
         quests: `POST /api/${SheetTabName.quests}/upload`,
         questList: `POST /api/${SheetTabName.questList}/upload`,
       },
@@ -241,6 +244,9 @@ const createUploadHandler = (tabName) => async (req, res) => {
 };
 
 // ========== 上傳路由 ==========
+app.post(`/api/${SheetTabName.maps}/upload`, createUploadHandler(SheetTabName.maps));
+app.post(`/api/${SheetTabName.items}/upload`, createUploadHandler(SheetTabName.items));
+app.post(`/api/${SheetTabName.objects}/upload`, createUploadHandler(SheetTabName.objects));
 app.post(`/api/${SheetTabName.quests}/upload`, createUploadHandler(SheetTabName.quests));
 app.post(`/api/${SheetTabName.questList}/upload`, createUploadHandler(SheetTabName.questList));
 
